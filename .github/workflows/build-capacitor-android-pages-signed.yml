@@ -1,0 +1,105 @@
+name: Build Capacitor Android (signed) and publish APK to Pages
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+
+env:
+  ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: Build web assets
+        run: npm run build
+
+      - name: Capacitor sync (copy web to native projects)
+        run: npx cap sync android
+
+      - name: Setup Java (for Gradle)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android commandline tools and SDK
+        run: |
+          set -e
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools"/* "$ANDROID_SDK_ROOT/cmdline-tools/tools/" || true
+          export PATH="$PATH:$ANDROID_SDK_ROOT/cmdline-tools/tools/bin"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+
+      - name: Decode keystore (from secret)
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: |
+          echo "Decoding keystore..."
+          mkdir -p android/app
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/keystore.jks
+
+      - name: Write keystore.properties for Gradle
+        run: |
+          cat > android/keystore.properties <<EOF
+          storeFile=keystore.jks
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          EOF
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Build release APK
+        working-directory: android
+        run: |
+          ./gradlew assembleRelease --no-daemon
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+
+      - name: Prepare site directory with APK and index
+        run: |
+          mkdir -p site
+          cp android/app/build/outputs/apk/release/app-release.apk site/app-release.apk
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <html>
+            <head><meta charset="utf-8"><title>Télécharger APK</title></head>
+            <body>
+              <h1>Télécharger l'APK</h1>
+              <p><a href="app-release.apk" download>Télécharger app-release.apk</a></p>
+              <p>Si l'installation est bloquée, activez "installer depuis des sources inconnues".</p>
+            </body>
+          </html>
+          HTML
+
+      - name: Upload artifact for Pages
+        uses: actions/upload-pages-artifact@v1
+        with:
+          path: ./site
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v1
